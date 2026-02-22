@@ -1,0 +1,143 @@
+{
+  "meal_formats": {
+    "mutt_bhojan": {
+      "names": ["Mutt Bhojan", "Mutt Meal", "Temple Meal", "Devasthana Prasadam", "Dasoha", "Anna Dasoha"],
+      "regions": ["Karnataka", "Tamil Nadu", "Andhra Pradesh"],
+      "serving": "Patravali (dried leaf plates) or banana leaf",
+      "characteristics": [
+        "Always vegetarian and sattvic (no onion, no garlic)",
+        "Multiple rice preparations + dal + sides",
+        "Served on overlapping dried leaves (patravali)",
+        "Moderate oil usage, ghee served separately",
+        "Balanced meal with protein (dal/kosambari), carbs (rice), fiber (palya)"
+      ],
+      "typical_items": [
+        "Plain white rice (center, largest portion)",
+        "Puliyogare OR Chitranna OR Tomato rice (flavored rice)",
+        "Tove/Dal (toor or moong dal)",
+        "Kosambari (soaked lentil salad with coconut)",
+        "Palya/Poriyal (dry vegetable stir-fry)",
+        "Chutney pudi (dry chutney powder)",
+        "Salt",
+        "Pickle (avakaya, maavina kai)",
+        "Payasa/Kheer (sweet, on special days)",
+        "Majjige/Buttermilk (served at end)",
+        "Gojju (tangy thick curry, sometimes)",
+        "Saaru/Rasam (peppery soup)"
+      ],
+      "visual_cues": [
+        "Overlapping dried leaves as plate (brown/beige colored leaves)",
+        "Rice in center, sides arranged around periphery",
+        "Small portions of 4-8 sides",
+        "No steel vessels or katoris"
+      ],
+      "avg_calories": "550-750 per serving",
+      "glycemic_notes": "Moderate-high due to rice volume. Mitigated by dal protein and fiber from palya/kosambari."
+    },
+    "kerala_sadhya": {
+      "names": ["Sadhya", "Onam Sadhya", "Kerala Feast"],
+      "regions": ["Kerala"],
+      "serving": "Banana leaf",
+      "typical_items": [
+        "Rice", "Sambar", "Rasam", "Avial", "Olan", "Kalan",
+        "Pachadi", "Thoran", "Mezhukupuratti", "Pappadam",
+        "Banana chips", "Pickle", "Payasam (2-3 types)",
+        "Parippu curry", "Ghee", "Buttermilk"
+      ],
+      "avg_calories": "800-1200 per serving"
+    },
+    "south_indian_thali": {
+      "names": ["Meals", "South Indian Thali", "Full Meals"],
+      "regions": ["Tamil Nadu", "Karnataka", "Andhra"],
+      "serving": "Banana leaf or steel plate",
+      "typical_items": [
+        "Rice", "Sambar", "Rasam", "Poriyal (2 types)",
+        "Kootu", "Curd", "Pickle", "Pappad", "Payasam"
+      ]
+    },
+    "north_indian_thali": {
+      "names": ["Thali", "North Indian Thali"],
+      "serving": "Steel plate with katoris",
+      "typical_items": [
+        "Roti/Paratha (2-3)", "Dal", "Paneer/Sabzi (2 types)",
+        "Rice", "Raita", "Pickle", "Salad", "Dessert"
+      ]
+    }
+  },
+  "dish_identification": {
+    "rice_varieties": {
+      "puliyogare": {
+        "visual": "Brownish-orange rice, visible peanuts, tamarind-coated grains",
+        "taste_profile": "Tangy, slightly sweet, spicy",
+        "calories_per_cup": 280,
+        "glycemic_impact": "moderate"
+      },
+      "chitranna": {
+        "visual": "Yellow rice with turmeric tint, peanuts, curry leaves",
+        "taste_profile": "Lemony, mild",
+        "calories_per_cup": 260,
+        "glycemic_impact": "moderate"
+      },
+      "tomato_rice": {
+        "visual": "Red-orange rice, sometimes with peas",
+        "calories_per_cup": 270,
+        "glycemic_impact": "moderate"
+      },
+      "bisi_bele_bath": {
+        "visual": "Brown-orange wet rice mixed with dal, vegetables",
+        "calories_per_cup": 300,
+        "glycemic_impact": "moderate_high"
+      },
+      "curd_rice": {
+        "visual": "White, creamy, yogurt-coated rice",
+        "calories_per_cup": 220,
+        "glycemic_impact": "low_moderate"
+      },
+      "vangi_bath": {
+        "visual": "Brownish rice with brinjal pieces",
+        "calories_per_cup": 290,
+        "glycemic_impact": "moderate"
+      }
+    },
+    "sides": {
+      "kosambari": {
+        "visual": "Soaked split moong/chana dal mixed with grated coconut, cucumber, coriander",
+        "calories_per_serving": 80,
+        "protein_g": 5,
+        "notes": "High protein, good fiber. One of the healthiest items in a mutt meal."
+      },
+      "palya": {
+        "visual": "Dry stir-fried vegetable — green beans, cabbage, beetroot, etc.",
+        "calories_per_serving": 60,
+        "fiber_g": 3,
+        "notes": "Good fiber source, low calorie"
+      },
+      "chutney_pudi": {
+        "visual": "Dry powder — reddish-brown (with red chillies) or greenish-yellow (with coriander/dill)",
+        "calories_per_tbsp": 25,
+        "notes": "Eaten mixed with rice and ghee. Peanut/sesame based = more nutritious."
+      },
+      "tove_dal": {
+        "visual": "Yellow liquid — toor dal or moong dal, seasoned with mustard, curry leaves",
+        "calories_per_serving": 120,
+        "protein_g": 7,
+        "glycemic_impact": "low"
+      },
+      "gojju": {
+        "visual": "Thick brownish-red tangy curry",
+        "calories_per_serving": 90,
+        "glycemic_impact": "low"
+      },
+      "rasam": {
+        "visual": "Thin reddish-brown soup with pepper, tomato",
+        "calories_per_serving": 40,
+        "notes": "Low calorie, good for digestion"
+      }
+    },
+    "visual_confusions": {
+      "rice_on_leaf_is_NOT_dosa": "If you see loose rice grains on a leaf plate with multiple small sides, it's a thali/mutt meal. Dosa is a SINGLE large golden-brown CREPE.",
+      "yellow_dal_is_NOT_kheer": "If it's thin/liquid and savory = dal/tove. If thick, sweet, with cardamom = payasa/kheer.",
+      "chutney_pudi_is_NOT_spice_mix": "Dry powder served as a side = chutney pudi, meant to be mixed with rice + ghee."
+    }
+  }
+}
