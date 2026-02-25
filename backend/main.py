@@ -1,12 +1,15 @@
 """
-NutriScan Backend - FastAPI + SQLite
-════════════════════════════════════
-Run:
-  export ANTHROPIC_API_KEY="sk-ant-your-key"
-  pip install -r requirements.txt
-  uvicorn main:app --reload --port 8000
+NutriScan Backend - Production Ready
+═════════════════════════════════════
+Local:    uvicorn main:app --reload --port 8000
+Production: gunicorn main:app -w 4 -k uvicorn.workers.UvicornWorker
 
-API Docs: http://localhost:8000/docs
+Env vars:
+  ANTHROPIC_API_KEY    - Claude API key
+  RAZORPAY_KEY_ID      - Razorpay key
+  RAZORPAY_KEY_SECRET  - Razorpay secret
+  DATABASE_URL         - PostgreSQL URL (optional, uses SQLite if absent)
+  FRONTEND_URL         - Frontend URL for CORS (optional)
 """
 
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
@@ -15,7 +18,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from typing import Optional, List
-import sqlite3
+from contextlib import contextmanager
 import hashlib
 import hmac
 import secrets
@@ -24,11 +27,29 @@ import base64
 import os
 import httpx
 
-app = FastAPI(title="NutriScan API", version="1.0.0")
+# ═══════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════
 
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "rzp_test_xxxxx")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+
+PLAN_AMOUNT_PAISE = 30000
+PLAN_DURATION_DAYS = 90
+PLAN_NAME = "NutriScan Pro — 3 Months"
+FREE_SCANS = 2
+
+USE_PG = bool(DATABASE_URL)
+
+app = FastAPI(title="NutriScan API", version="2.0.0")
+
+cors_origins = ["*"] if FRONTEND_URL == "*" else [FRONTEND_URL, "http://localhost:5173"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Restrict in production
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,120 +57,265 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-DB_PATH = "nutriscan.db"
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "your-api-key-here")
-
-# Razorpay config — get keys from https://dashboard.razorpay.com/app/keys
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "rzp_test_xxxxx")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "your-razorpay-secret")
-
-# Subscription plan
-PLAN_AMOUNT_PAISE = 30000  # ₹300 in paise
-PLAN_DURATION_DAYS = 90    # 3 months
-PLAN_NAME = "NutriScan Pro — 3 Months"
-FREE_SCANS = 2             # Free scans before paywall
-
 
 # ═══════════════════════════════════════════
-# DATABASE
+# DATABASE LAYER (PostgreSQL + SQLite)
 # ═══════════════════════════════════════════
+
+if USE_PG:
+    import psycopg2
+    import psycopg2.extras
+
+class DictRow(dict):
+    """Make dict behave like sqlite3.Row for key access."""
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return super().__getitem__(key)
+        return super().__getitem__(key)
+
+class DBConnection:
+    """Unified database wrapper for both SQLite and PostgreSQL."""
+
+    def __init__(self):
+        if USE_PG:
+            self.conn = psycopg2.connect(DATABASE_URL)
+            self.is_pg = True
+        else:
+            import sqlite3
+            self.conn = sqlite3.connect("nutriscan.db")
+            self.conn.row_factory = sqlite3.Row
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.is_pg = False
+
+    def _convert_sql(self, sql):
+        """Convert ? placeholders to %s for PostgreSQL."""
+        if self.is_pg:
+            return sql.replace("?", "%s")
+        return sql
+
+    def execute(self, sql, params=None):
+        sql = self._convert_sql(sql)
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if self.is_pg else self.conn.cursor()
+        if params:
+            cur.execute(sql, params)
+        else:
+            cur.execute(sql)
+        self._last_cursor = cur
+        return self
+
+    @property
+    def lastrowid(self):
+        if self.is_pg:
+            return getattr(self._last_cursor, 'fetchone', lambda: {})()
+        return self._last_cursor.lastrowid
+
+    def fetchone(self):
+        row = self._last_cursor.fetchone()
+        if row is None:
+            return None
+        if self.is_pg:
+            return dict(row)
+        return dict(row)
+
+    def fetchall(self):
+        rows = self._last_cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return DBConnection()
+
+
+# Schema
+PG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    name TEXT NOT NULL,
+    age INTEGER,
+    gender TEXT,
+    weight_kg REAL,
+    height_cm REAL,
+    activity_level TEXT DEFAULT 'moderate',
+    health_goal TEXT DEFAULT 'maintain',
+    dietary_preference TEXT DEFAULT 'non-veg',
+    health_conditions TEXT DEFAULT '[]',
+    daily_calorie_target INTEGER DEFAULT 2000,
+    token TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS meals (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    day_number INTEGER NOT NULL,
+    meal_number INTEGER NOT NULL,
+    meal_type TEXT NOT NULL,
+    meal_format TEXT,
+    meal_name TEXT,
+    photo_base64 TEXT,
+    total_calories INTEGER,
+    total_weight_g INTEGER,
+    protein_g REAL,
+    carbs_g REAL,
+    fat_g REAL,
+    fiber_g REAL,
+    items_json TEXT DEFAULT '[]',
+    glycemic_impact TEXT,
+    sugar_peak_mg_dl INTEGER,
+    sugar_peak_minutes INTEGER,
+    sugar_explanation TEXT,
+    insulin_resistance_risk TEXT DEFAULT 'low',
+    insulin_resistance_explanation TEXT,
+    micronutrients_notable TEXT DEFAULT '[]',
+    micronutrients_lacking TEXT DEFAULT '[]',
+    healthiness_score INTEGER,
+    health_notes TEXT,
+    recommendations TEXT,
+    recommended_alternatives_json TEXT DEFAULT '[]',
+    confidence TEXT DEFAULT 'medium',
+    logged_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS daily_summary (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    day_number INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    total_calories INTEGER DEFAULT 0,
+    total_weight_g INTEGER DEFAULT 0,
+    total_protein_g REAL DEFAULT 0,
+    total_carbs_g REAL DEFAULT 0,
+    total_fat_g REAL DEFAULT 0,
+    total_fiber_g REAL DEFAULT 0,
+    meal_count INTEGER DEFAULT 0,
+    avg_healthiness REAL DEFAULT 0,
+    high_sugar_meals INTEGER DEFAULT 0,
+    high_insulin_risk_meals INTEGER DEFAULT 0,
+    daily_recommendation TEXT,
+    UNIQUE(user_id, day_number)
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    razorpay_order_id TEXT,
+    razorpay_payment_id TEXT,
+    razorpay_signature TEXT,
+    amount_paise INTEGER NOT NULL,
+    status TEXT DEFAULT 'created',
+    starts_at TIMESTAMP,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+"""
+
+SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    name TEXT NOT NULL,
+    age INTEGER,
+    gender TEXT,
+    weight_kg REAL,
+    height_cm REAL,
+    activity_level TEXT DEFAULT 'moderate',
+    health_goal TEXT DEFAULT 'maintain',
+    dietary_preference TEXT DEFAULT 'non-veg',
+    health_conditions TEXT DEFAULT '[]',
+    daily_calorie_target INTEGER DEFAULT 2000,
+    token TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS meals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    day_number INTEGER NOT NULL,
+    meal_number INTEGER NOT NULL,
+    meal_type TEXT NOT NULL,
+    meal_format TEXT,
+    meal_name TEXT,
+    photo_base64 TEXT,
+    total_calories INTEGER,
+    total_weight_g INTEGER,
+    protein_g REAL,
+    carbs_g REAL,
+    fat_g REAL,
+    fiber_g REAL,
+    items_json TEXT DEFAULT '[]',
+    glycemic_impact TEXT,
+    sugar_peak_mg_dl INTEGER,
+    sugar_peak_minutes INTEGER,
+    sugar_explanation TEXT,
+    insulin_resistance_risk TEXT DEFAULT 'low',
+    insulin_resistance_explanation TEXT,
+    micronutrients_notable TEXT DEFAULT '[]',
+    micronutrients_lacking TEXT DEFAULT '[]',
+    healthiness_score INTEGER,
+    health_notes TEXT,
+    recommendations TEXT,
+    recommended_alternatives_json TEXT DEFAULT '[]',
+    confidence TEXT DEFAULT 'medium',
+    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS daily_summary (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    day_number INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    total_calories INTEGER DEFAULT 0,
+    total_weight_g INTEGER DEFAULT 0,
+    total_protein_g REAL DEFAULT 0,
+    total_carbs_g REAL DEFAULT 0,
+    total_fat_g REAL DEFAULT 0,
+    total_fiber_g REAL DEFAULT 0,
+    meal_count INTEGER DEFAULT 0,
+    avg_healthiness REAL DEFAULT 0,
+    high_sugar_meals INTEGER DEFAULT 0,
+    high_insulin_risk_meals INTEGER DEFAULT 0,
+    daily_recommendation TEXT,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    UNIQUE(user_id, day_number)
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    razorpay_order_id TEXT,
+    razorpay_payment_id TEXT,
+    razorpay_signature TEXT,
+    amount_paise INTEGER NOT NULL,
+    status TEXT DEFAULT 'created',
+    starts_at TIMESTAMP,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+"""
 
 
 def init_db():
-    conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            name TEXT NOT NULL,
-            age INTEGER,
-            gender TEXT,
-            weight_kg REAL,
-            height_cm REAL,
-            activity_level TEXT DEFAULT 'moderate',
-            health_goal TEXT DEFAULT 'maintain',
-            dietary_preference TEXT DEFAULT 'non-veg',
-            health_conditions TEXT DEFAULT '[]',
-            daily_calorie_target INTEGER DEFAULT 2000,
-            token TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS meals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            day_number INTEGER NOT NULL,
-            meal_number INTEGER NOT NULL,
-            meal_type TEXT NOT NULL,
-            meal_format TEXT,
-            meal_name TEXT,
-            photo_base64 TEXT,
-            total_calories INTEGER,
-            total_weight_g INTEGER,
-            protein_g REAL,
-            carbs_g REAL,
-            fat_g REAL,
-            fiber_g REAL,
-            items_json TEXT DEFAULT '[]',
-            glycemic_impact TEXT,
-            sugar_peak_mg_dl INTEGER,
-            sugar_peak_minutes INTEGER,
-            sugar_explanation TEXT,
-            insulin_resistance_risk TEXT DEFAULT 'low',
-            insulin_resistance_explanation TEXT,
-            micronutrients_notable TEXT DEFAULT '[]',
-            micronutrients_lacking TEXT DEFAULT '[]',
-            healthiness_score INTEGER,
-            health_notes TEXT,
-            recommendations TEXT,
-            confidence TEXT DEFAULT 'medium',
-            logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-
-        CREATE TABLE IF NOT EXISTS daily_summary (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            day_number INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            total_calories INTEGER DEFAULT 0,
-            total_weight_g INTEGER DEFAULT 0,
-            total_protein_g REAL DEFAULT 0,
-            total_carbs_g REAL DEFAULT 0,
-            total_fat_g REAL DEFAULT 0,
-            total_fiber_g REAL DEFAULT 0,
-            meal_count INTEGER DEFAULT 0,
-            avg_healthiness REAL DEFAULT 0,
-            high_sugar_meals INTEGER DEFAULT 0,
-            high_insulin_risk_meals INTEGER DEFAULT 0,
-            daily_recommendation TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            UNIQUE(user_id, day_number)
-        );
-
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            razorpay_order_id TEXT,
-            razorpay_payment_id TEXT,
-            razorpay_signature TEXT,
-            amount_paise INTEGER NOT NULL,
-            status TEXT DEFAULT 'created',
-            starts_at TIMESTAMP,
-            expires_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-    """)
-    conn.close()
+    db = get_db()
+    schema = PG_SCHEMA if USE_PG else SQLITE_SCHEMA
+    if USE_PG:
+        db.execute(schema)
+    else:
+        db.conn.executescript(schema)
+    db.commit()
+    db.close()
+    print(f"✅ Database initialized ({'PostgreSQL' if USE_PG else 'SQLite'})")
 
 
 init_db()
@@ -167,19 +333,24 @@ def generate_token() -> str:
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE token = ?", (token,)).fetchone()
-    conn.close()
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE token = ?", (token,)).fetchone()
+    db.close()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
-    return dict(user)
+    return user
 
-def calculate_day_number(created_at: str) -> int:
-    reg_date = datetime.fromisoformat(created_at).date()
+def calculate_day_number(created_at) -> int:
+    if isinstance(created_at, str):
+        reg_date = datetime.fromisoformat(created_at.replace("+00:00", "")).date()
+    elif isinstance(created_at, datetime):
+        reg_date = created_at.date()
+    else:
+        reg_date = date.today()
     return (date.today() - reg_date).days + 1
 
-def get_meal_number_today(conn, user_id: int, day_number: int) -> int:
-    result = conn.execute(
+def get_meal_number_today(db, user_id: int, day_number: int) -> int:
+    result = db.execute(
         "SELECT COUNT(*) as count FROM meals WHERE user_id = ? AND day_number = ?",
         (user_id, day_number)
     ).fetchone()
@@ -220,6 +391,11 @@ class ProfileUpdate(BaseModel):
     health_conditions: Optional[List[str]] = None
     daily_calorie_target: Optional[int] = None
 
+class PaymentVerification(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
 
 # ═══════════════════════════════════════════
 # AUTH ROUTES
@@ -227,10 +403,10 @@ class ProfileUpdate(BaseModel):
 
 @app.post("/api/register")
 def register(req: RegisterRequest):
-    conn = get_db()
+    db = get_db()
     try:
         token = generate_token()
-        conn.execute(
+        db.execute(
             """INSERT INTO users (email, password_hash, name, age, gender, weight_kg,
                height_cm, activity_level, health_goal, dietary_preference,
                health_conditions, daily_calorie_target, token)
@@ -240,26 +416,29 @@ def register(req: RegisterRequest):
              req.dietary_preference, json.dumps(req.health_conditions),
              req.daily_calorie_target, token)
         )
-        conn.commit()
+        db.commit()
         return {"token": token, "message": "Registration successful"}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="Email already registered")
+    except Exception as e:
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        conn.close()
+        db.close()
 
 @app.post("/api/login")
 def login(req: LoginRequest):
-    conn = get_db()
-    user = conn.execute(
+    db = get_db()
+    user = db.execute(
         "SELECT * FROM users WHERE email = ? AND password_hash = ?",
         (req.email, hash_password(req.password))
     ).fetchone()
     if not user:
+        db.close()
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = generate_token()
-    conn.execute("UPDATE users SET token = ? WHERE id = ?", (token, user["id"]))
-    conn.commit()
-    conn.close()
+    db.execute("UPDATE users SET token = ? WHERE id = ?", (token, user["id"]))
+    db.commit()
+    db.close()
     return {"token": token, "name": user["name"]}
 
 @app.get("/api/profile")
@@ -271,22 +450,24 @@ def get_profile(user=Depends(get_current_user)):
         "health_goal": user["health_goal"], "dietary_preference": user["dietary_preference"],
         "health_conditions": json.loads(user["health_conditions"] or "[]"),
         "daily_calorie_target": user["daily_calorie_target"],
-        "member_since": user["created_at"],
+        "member_since": str(user["created_at"]),
         "current_day": calculate_day_number(user["created_at"])
     }
 
 @app.put("/api/profile")
 def update_profile(req: ProfileUpdate, user=Depends(get_current_user)):
-    conn = get_db()
+    db = get_db()
     updates = {k: v for k, v in req.dict().items() if v is not None}
     if "health_conditions" in updates:
         updates["health_conditions"] = json.dumps(updates["health_conditions"])
     if updates:
         set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
-        conn.execute(f"UPDATE users SET {set_clause} WHERE id = ?",
-                     [*updates.values(), user["id"]])
-        conn.commit()
-    conn.close()
+        sql = f"UPDATE users SET {set_clause} WHERE id = ?"
+        if USE_PG:
+            sql = sql.replace("?", "%s")
+        db.conn.cursor().execute(sql, [*updates.values(), user["id"]])
+        db.commit()
+    db.close()
     return {"message": "Profile updated"}
 
 
@@ -295,26 +476,24 @@ def update_profile(req: ProfileUpdate, user=Depends(get_current_user)):
 # ═══════════════════════════════════════════
 
 def check_subscription(user_id: int) -> dict:
-    """Check if user has active subscription or free scans remaining."""
-    conn = get_db()
+    db = get_db()
 
-    # Check active subscription
-    sub = conn.execute(
-        """SELECT * FROM subscriptions WHERE user_id = ? AND status = 'paid'
-           AND expires_at > datetime('now') ORDER BY expires_at DESC LIMIT 1""",
+    now_expr = "NOW()" if USE_PG else "datetime('now')"
+    sub = db.execute(
+        f"""SELECT * FROM subscriptions WHERE user_id = ? AND status = 'paid'
+            AND expires_at > {now_expr} ORDER BY expires_at DESC LIMIT 1""",
         (user_id,)
     ).fetchone()
 
     if sub:
-        conn.close()
-        return {"active": True, "expires_at": sub["expires_at"], "plan": PLAN_NAME}
+        db.close()
+        return {"active": True, "expires_at": str(sub["expires_at"]), "plan": PLAN_NAME}
 
-    # Check free scans used
-    scan_count = conn.execute(
+    scan_count = db.execute(
         "SELECT COUNT(*) as c FROM meals WHERE user_id = ?", (user_id,)
     ).fetchone()["c"]
 
-    conn.close()
+    db.close()
     return {
         "active": scan_count < FREE_SCANS,
         "free_scans_used": scan_count,
@@ -329,7 +508,7 @@ def subscription_status(user=Depends(get_current_user)):
     return {
         **status,
         "plan_name": PLAN_NAME,
-        "plan_amount": PLAN_AMOUNT_PAISE / 100,  # Return in rupees
+        "plan_amount": PLAN_AMOUNT_PAISE / 100,
         "plan_duration_days": PLAN_DURATION_DAYS,
         "razorpay_key_id": RAZORPAY_KEY_ID,
     }
@@ -337,9 +516,7 @@ def subscription_status(user=Depends(get_current_user)):
 
 @app.post("/api/subscription/create-order")
 async def create_razorpay_order(user=Depends(get_current_user)):
-    """Create a Razorpay order for ₹300."""
     import time
-
     receipt = f"ns_{user['id']}_{int(time.time())}"
 
     async with httpx.AsyncClient() as client:
@@ -351,69 +528,46 @@ async def create_razorpay_order(user=Depends(get_current_user)):
                     "amount": PLAN_AMOUNT_PAISE,
                     "currency": "INR",
                     "receipt": receipt,
-                    "notes": {
-                        "user_id": str(user["id"]),
-                        "plan": PLAN_NAME,
-                    }
+                    "notes": {"user_id": str(user["id"]), "plan": PLAN_NAME}
                 }
             )
             if resp.status_code != 200:
                 raise HTTPException(status_code=500, detail=f"Razorpay error: {resp.text}")
             order = resp.json()
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=500, detail=f"Payment gateway error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Payment error: {str(e)}")
 
-    # Store order in DB
-    conn = get_db()
-    conn.execute(
+    db = get_db()
+    db.execute(
         """INSERT INTO subscriptions (user_id, razorpay_order_id, amount_paise, status)
            VALUES (?, ?, ?, 'created')""",
         (user["id"], order["id"], PLAN_AMOUNT_PAISE)
     )
-    conn.commit()
-    conn.close()
+    db.commit()
+    db.close()
 
     return {
-        "order_id": order["id"],
-        "amount": PLAN_AMOUNT_PAISE,
-        "currency": "INR",
-        "key_id": RAZORPAY_KEY_ID,
-        "name": "NutriScan",
-        "description": PLAN_NAME,
-        "prefill": {
-            "name": user["name"],
-            "email": user["email"],
-        }
+        "order_id": order["id"], "amount": PLAN_AMOUNT_PAISE, "currency": "INR",
+        "key_id": RAZORPAY_KEY_ID, "name": "NutriScan", "description": PLAN_NAME,
+        "prefill": {"name": user["name"], "email": user["email"]}
     }
-
-
-class PaymentVerification(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
 
 
 @app.post("/api/subscription/verify")
 def verify_payment(req: PaymentVerification, user=Depends(get_current_user)):
-    """Verify Razorpay payment signature and activate subscription."""
-
-    # Verify signature
     message = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected_signature = hmac.new(
-        RAZORPAY_KEY_SECRET.encode(),
-        message.encode(),
-        hashlib.sha256
+    expected = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(), message.encode(), hashlib.sha256
     ).hexdigest()
 
-    if expected_signature != req.razorpay_signature:
+    if expected != req.razorpay_signature:
         raise HTTPException(status_code=400, detail="Payment verification failed")
 
-    # Activate subscription
-    conn = get_db()
+    db = get_db()
     now = datetime.now()
     expires = now + timedelta(days=PLAN_DURATION_DAYS)
 
-    conn.execute(
+    db.execute(
         """UPDATE subscriptions
            SET razorpay_payment_id = ?, razorpay_signature = ?,
                status = 'paid', starts_at = ?, expires_at = ?
@@ -422,27 +576,25 @@ def verify_payment(req: PaymentVerification, user=Depends(get_current_user)):
          now.isoformat(), expires.isoformat(),
          req.razorpay_order_id, user["id"])
     )
-    conn.commit()
-    conn.close()
+    db.commit()
+    db.close()
 
     return {
-        "status": "active",
-        "message": "Payment successful! Subscription activated.",
-        "starts_at": now.isoformat(),
-        "expires_at": expires.isoformat(),
+        "status": "active", "message": "Payment successful!",
+        "starts_at": now.isoformat(), "expires_at": expires.isoformat(),
     }
 
 
 @app.get("/api/subscription/history")
 def subscription_history(user=Depends(get_current_user)):
-    conn = get_db()
-    subs = conn.execute(
+    db = get_db()
+    subs = db.execute(
         """SELECT id, amount_paise, status, starts_at, expires_at, created_at
            FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC""",
         (user["id"],)
     ).fetchall()
-    conn.close()
-    return {"subscriptions": [dict(s) for s in subs]}
+    db.close()
+    return {"subscriptions": subs}
 
 
 # ═══════════════════════════════════════════
@@ -466,29 +618,19 @@ CRITICAL — MEAL FORMAT RECOGNITION (identify format FIRST, then items):
 **South Indian Dish Identification:**
 - Puliyogare: Tamarind rice, brownish-orange, tangy, peanuts
 - Chitranna: Lemon rice, yellow, turmeric, peanuts
-- Tomato Rice: Red-orange rice
-- Bisi Bele Bath: Spicy dal-rice mix, brownish-wet
 - Kosambari: Soaked moong/chana dal salad with coconut, cucumber, coriander
-- Palya/Poriyal: Dry stir-fried vegetable (beans, cabbage, greens, etc.)
-- Chutney Pudi: Dry powder (reddish or greenish), eaten with rice + ghee
-- Tove/Pappu: Plain dal (toor/moong), yellow liquid
-- Gojju: Thick tangy curry
+- Palya/Poriyal: Dry stir-fried vegetable
+- Chutney Pudi: Dry powder, eaten with rice + ghee
+- Tove/Pappu: Plain dal, yellow liquid
 - Saaru/Rasam: Thin peppery soup
 - Payasa/Kheer: Sweet dessert
-- Majjige Huli: Buttermilk curry
-
-**Serving Vessel = Format Clue:**
-- Patravali (dried overlapping leaves) = Mutt bhojan / temple meal
-- Banana leaf = Sadhya or Tamil meals
-- Steel plate + katoris = Restaurant/home thali
 
 **INSULIN RESISTANCE RISK ASSESSMENT:**
-Evaluate the meal's potential to contribute to insulin resistance over time:
-- HIGH: Heavy refined carbs (white rice > 250g, maida items, sugary desserts), low fiber, low protein, fried + sweet combos, large portions of high-GI foods
-- MODERATE: Mixed — some refined carbs but balanced with dal/protein, moderate fiber, reasonable portions
-- LOW: Whole grains/millets, high fiber, good protein, low glycemic load, balanced macros, vegetables dominating
+- HIGH: Heavy refined carbs (white rice > 250g, maida items, sugary desserts), low fiber, low protein, fried + sweet combos
+- MODERATE: Mixed — some refined carbs but balanced with dal/protein, moderate fiber
+- LOW: Whole grains/millets, high fiber, good protein, low glycemic load, balanced macros
 
-Key Indian risk factors: Excess white rice without dal, sweets after heavy meal, maida-based breads (naan/kulcha vs roti), sugary beverages, repeated high-carb meals through the day.
+Key Indian risk factors: Excess white rice without dal, sweets after heavy meal, maida-based breads, sugary beverages.
 
 User context:
 - Health goal: {health_goal}
@@ -517,7 +659,7 @@ Respond ONLY with valid JSON (no markdown, no backticks):
   }},
   "insulin_resistance": {{
     "risk": "low" | "moderate" | "high",
-    "explanation": "Why this meal poses this level of insulin resistance risk, referencing specific items and their glycemic/macro profile"
+    "explanation": "Why this meal poses this level of insulin resistance risk"
   }},
   "items": [
     {{ "name": "Regional name (English translation)", "portion": "Estimated portion", "weight_g": number, "calories": number }}
@@ -528,10 +670,26 @@ Respond ONLY with valid JSON (no markdown, no backticks):
   }},
   "health_notes": "Brief health insight",
   "healthiness_score": number_1_to_10,
-  "recommendations": "2-3 specific suggestions considering user's goals"
+  "recommendations": "2-3 specific suggestions considering user's goals",
+  "recommended_alternatives": [
+    {{
+      "name": "Indian dish name in English",
+      "description": "1-line why this is better for the user's goals",
+      "calories": approximate_number,
+      "image_search_term": "specific food photo search term e.g. 'ragi dosa chutney' or 'moong dal khichdi bowl'"
+    }}
+  ]
 }}
 
-Be realistic. Estimate weight in grams using standard Indian serving references (1 katori dal ~150g, 1 cup cooked rice ~200g, 1 roti ~40g, 1 dosa ~80g). Account for oil/ghee/coconut in Indian cooking. Mutt meals use moderate oil and are sattvic."""
+IMPORTANT for recommended_alternatives:
+- Suggest 2-3 SPECIFIC Indian alternatives that are healthier or better suited for the user's health goal
+- Each alternative should be a REAL Indian dish (regional names welcome)
+- Focus on dishes that address the shortcomings of the analyzed meal
+- For diabetic users: suggest low-GI alternatives
+- For weight loss: suggest lower calorie, high protein options
+- image_search_term should be a vivid, specific food photography description (3-5 words)
+
+Be realistic. Estimate weight using standard Indian serving references (1 katori dal ~150g, 1 cup rice ~200g, 1 roti ~40g). Account for oil/ghee in Indian cooking."""
 
 
 # ═══════════════════════════════════════════
@@ -544,13 +702,10 @@ async def analyze_meal(
     meal_type: str = Form("lunch"),
     user=Depends(get_current_user)
 ):
-    # ── Paywall check ──
+    # Paywall
     sub_status = check_subscription(user["id"])
     if not sub_status["active"]:
-        raise HTTPException(
-            status_code=402,
-            detail="subscription_required"
-        )
+        raise HTTPException(status_code=402, detail="subscription_required")
 
     content = await photo.read()
     image_base64 = base64.b64encode(content).decode("utf-8")
@@ -575,13 +730,10 @@ async def analyze_meal(
                 json={
                     "model": "claude-sonnet-4-20250514",
                     "max_tokens": 1500,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}},
-                            {"type": "text", "text": prompt}
-                        ]
-                    }]
+                    "messages": [{"role": "user", "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_base64}},
+                        {"type": "text", "text": prompt}
+                    ]}]
                 }
             )
             data = resp.json()
@@ -590,57 +742,83 @@ async def analyze_meal(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
-    conn = get_db()
+    db = get_db()
     day_number = calculate_day_number(user["created_at"])
-    meal_number = get_meal_number_today(conn, user["id"], day_number)
-    photo_thumb = image_base64[:200] + "..."  # Production: store full image in S3/GCS
+    meal_number = get_meal_number_today(db, user["id"], day_number)
+    photo_thumb = image_base64[:200] + "..."
 
     insulin = analysis.get("insulin_resistance", {})
 
-    cursor = conn.execute(
-        """INSERT INTO meals (user_id, day_number, meal_number, meal_type, meal_format, meal_name,
-           photo_base64, total_calories, total_weight_g, protein_g, carbs_g, fat_g, fiber_g,
-           items_json, glycemic_impact, sugar_peak_mg_dl, sugar_peak_minutes,
-           sugar_explanation, insulin_resistance_risk, insulin_resistance_explanation,
-           micronutrients_notable, micronutrients_lacking,
-           healthiness_score, health_notes, recommendations, confidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (user["id"], day_number, meal_number, meal_type,
-         analysis.get("meal_format", ""), analysis["meal_name"],
-         photo_thumb, analysis["total_calories"], analysis.get("total_weight_g", 0),
-         analysis["macros"]["protein_g"], analysis["macros"]["carbs_g"],
-         analysis["macros"]["fat_g"], analysis["macros"]["fiber_g"],
-         json.dumps(analysis["items"]), analysis["sugar_spike"]["glycemic_impact"],
-         analysis["sugar_spike"]["estimated_peak_mg_dl"],
-         analysis["sugar_spike"]["time_to_peak_minutes"],
-         analysis["sugar_spike"]["explanation"],
-         insulin.get("risk", "low"), insulin.get("explanation", ""),
-         json.dumps(analysis["micronutrients"]["notable"]),
-         json.dumps(analysis["micronutrients"]["lacking"]),
-         analysis["healthiness_score"], analysis["health_notes"],
-         analysis["recommendations"], analysis["confidence"])
-    )
-    meal_id = cursor.lastrowid
+    if USE_PG:
+        db.execute(
+            """INSERT INTO meals (user_id, day_number, meal_number, meal_type, meal_format, meal_name,
+               photo_base64, total_calories, total_weight_g, protein_g, carbs_g, fat_g, fiber_g,
+               items_json, glycemic_impact, sugar_peak_mg_dl, sugar_peak_minutes,
+               sugar_explanation, insulin_resistance_risk, insulin_resistance_explanation,
+               micronutrients_notable, micronutrients_lacking,
+               healthiness_score, health_notes, recommendations, recommended_alternatives_json, confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               RETURNING id""",
+            (user["id"], day_number, meal_number, meal_type,
+             analysis.get("meal_format", ""), analysis["meal_name"],
+             photo_thumb, analysis["total_calories"], analysis.get("total_weight_g", 0),
+             analysis["macros"]["protein_g"], analysis["macros"]["carbs_g"],
+             analysis["macros"]["fat_g"], analysis["macros"]["fiber_g"],
+             json.dumps(analysis["items"]), analysis["sugar_spike"]["glycemic_impact"],
+             analysis["sugar_spike"]["estimated_peak_mg_dl"],
+             analysis["sugar_spike"]["time_to_peak_minutes"],
+             analysis["sugar_spike"]["explanation"],
+             insulin.get("risk", "low"), insulin.get("explanation", ""),
+             json.dumps(analysis["micronutrients"]["notable"]),
+             json.dumps(analysis["micronutrients"]["lacking"]),
+             analysis["healthiness_score"], analysis["health_notes"],
+             analysis["recommendations"],
+             json.dumps(analysis.get("recommended_alternatives", [])),
+             analysis["confidence"])
+        )
+        meal_id = db._last_cursor.fetchone()["id"]
+    else:
+        db.execute(
+            """INSERT INTO meals (user_id, day_number, meal_number, meal_type, meal_format, meal_name,
+               photo_base64, total_calories, total_weight_g, protein_g, carbs_g, fat_g, fiber_g,
+               items_json, glycemic_impact, sugar_peak_mg_dl, sugar_peak_minutes,
+               sugar_explanation, insulin_resistance_risk, insulin_resistance_explanation,
+               micronutrients_notable, micronutrients_lacking,
+               healthiness_score, health_notes, recommendations, recommended_alternatives_json, confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user["id"], day_number, meal_number, meal_type,
+             analysis.get("meal_format", ""), analysis["meal_name"],
+             photo_thumb, analysis["total_calories"], analysis.get("total_weight_g", 0),
+             analysis["macros"]["protein_g"], analysis["macros"]["carbs_g"],
+             analysis["macros"]["fat_g"], analysis["macros"]["fiber_g"],
+             json.dumps(analysis["items"]), analysis["sugar_spike"]["glycemic_impact"],
+             analysis["sugar_spike"]["estimated_peak_mg_dl"],
+             analysis["sugar_spike"]["time_to_peak_minutes"],
+             analysis["sugar_spike"]["explanation"],
+             insulin.get("risk", "low"), insulin.get("explanation", ""),
+             json.dumps(analysis["micronutrients"]["notable"]),
+             json.dumps(analysis["micronutrients"]["lacking"]),
+             analysis["healthiness_score"], analysis["health_notes"],
+             analysis["recommendations"],
+             json.dumps(analysis.get("recommended_alternatives", [])),
+             analysis["confidence"])
+        )
+        meal_id = db._last_cursor.lastrowid
 
-    _update_daily_summary(conn, user["id"], day_number)
-    conn.commit()
-    conn.close()
+    _update_daily_summary(db, user["id"], day_number)
+    db.commit()
+    db.close()
 
-    return {
-        "meal_id": meal_id,
-        "day_number": day_number,
-        "meal_number": meal_number,
-        "meal_type": meal_type,
-        **analysis
-    }
+    return {"meal_id": meal_id, "day_number": day_number, "meal_number": meal_number,
+            "meal_type": meal_type, **analysis}
 
 
 # ═══════════════════════════════════════════
 # DAILY SUMMARY
 # ═══════════════════════════════════════════
 
-def _update_daily_summary(conn, user_id: int, day_number: int):
-    meals = conn.execute(
+def _update_daily_summary(db, user_id: int, day_number: int):
+    meals = db.execute(
         "SELECT * FROM meals WHERE user_id = ? AND day_number = ?",
         (user_id, day_number)
     ).fetchall()
@@ -657,7 +835,7 @@ def _update_daily_summary(conn, user_id: int, day_number: int):
     high_sugar = sum(1 for m in meals if m["glycemic_impact"] in ("high", "very_high"))
     high_insulin = sum(1 for m in meals if m["insulin_resistance_risk"] == "high")
 
-    conn.execute(
+    db.execute(
         """INSERT INTO daily_summary (user_id, day_number, date, total_calories, total_weight_g,
            total_protein_g, total_carbs_g, total_fat_g, total_fiber_g,
            meal_count, avg_healthiness, high_sugar_meals, high_insulin_risk_meals)
@@ -681,92 +859,86 @@ def _update_daily_summary(conn, user_id: int, day_number: int):
 
 @app.get("/api/dashboard/today")
 def dashboard_today(user=Depends(get_current_user)):
-    conn = get_db()
+    db = get_db()
     day_number = calculate_day_number(user["created_at"])
-    meals = conn.execute(
+    meals = db.execute(
         """SELECT id, day_number, meal_number, meal_type, meal_format, meal_name,
            total_calories, total_weight_g, protein_g, carbs_g, fat_g, fiber_g,
            glycemic_impact, sugar_peak_mg_dl, sugar_peak_minutes, sugar_explanation,
            insulin_resistance_risk, insulin_resistance_explanation,
-           healthiness_score, health_notes, recommendations, items_json, confidence, logged_at
+           healthiness_score, health_notes, recommendations, recommended_alternatives_json, items_json, confidence, logged_at
            FROM meals WHERE user_id = ? AND day_number = ? ORDER BY meal_number""",
         (user["id"], day_number)
     ).fetchall()
-    summary = conn.execute(
+    summary = db.execute(
         "SELECT * FROM daily_summary WHERE user_id = ? AND day_number = ?",
         (user["id"], day_number)
     ).fetchone()
-    conn.close()
+    db.close()
     return {
-        "day_number": day_number,
-        "date": date.today().isoformat(),
+        "day_number": day_number, "date": date.today().isoformat(),
         "calorie_target": user["daily_calorie_target"],
-        "meals": [dict(m) for m in meals],
-        "summary": dict(summary) if summary else None
+        "meals": meals, "summary": summary
     }
 
 @app.get("/api/dashboard/history")
 def dashboard_history(days: int = 7, user=Depends(get_current_user)):
-    conn = get_db()
+    db = get_db()
     current_day = calculate_day_number(user["created_at"])
     start_day = max(1, current_day - days + 1)
-    summaries = conn.execute(
+    summaries = db.execute(
         """SELECT * FROM daily_summary WHERE user_id = ?
            AND day_number BETWEEN ? AND ? ORDER BY day_number DESC""",
         (user["id"], start_day, current_day)
     ).fetchall()
-    conn.close()
-    return {
-        "current_day": current_day,
-        "days": [dict(s) for s in summaries],
-        "calorie_target": user["daily_calorie_target"]
-    }
+    db.close()
+    return {"current_day": current_day, "days": summaries,
+            "calorie_target": user["daily_calorie_target"]}
 
 @app.get("/api/dashboard/meals")
 def get_meals_history(day: Optional[int] = None, limit: int = 20, offset: int = 0,
                       user=Depends(get_current_user)):
-    conn = get_db()
+    db = get_db()
     if day:
-        meals = conn.execute(
+        meals = db.execute(
             "SELECT * FROM meals WHERE user_id = ? AND day_number = ? ORDER BY meal_number LIMIT ? OFFSET ?",
             (user["id"], day, limit, offset)).fetchall()
     else:
-        meals = conn.execute(
+        meals = db.execute(
             "SELECT * FROM meals WHERE user_id = ? ORDER BY day_number DESC, meal_number DESC LIMIT ? OFFSET ?",
             (user["id"], limit, offset)).fetchall()
-    conn.close()
-    return {"meals": [dict(m) for m in meals]}
+    db.close()
+    return {"meals": meals}
 
 @app.delete("/api/meals/{meal_id}")
 def delete_meal(meal_id: int, user=Depends(get_current_user)):
-    conn = get_db()
-    meal = conn.execute(
+    db = get_db()
+    meal = db.execute(
         "SELECT * FROM meals WHERE id = ? AND user_id = ?",
         (meal_id, user["id"])
     ).fetchone()
     if not meal:
-        conn.close()
+        db.close()
         raise HTTPException(status_code=404, detail="Meal not found")
     day_number = meal["day_number"]
-    conn.execute("DELETE FROM meals WHERE id = ? AND user_id = ?", (meal_id, user["id"]))
-    _update_daily_summary(conn, user["id"], day_number)
-    # Clean up empty daily summary
-    remaining = conn.execute(
+    db.execute("DELETE FROM meals WHERE id = ? AND user_id = ?", (meal_id, user["id"]))
+    _update_daily_summary(db, user["id"], day_number)
+    remaining = db.execute(
         "SELECT COUNT(*) as c FROM meals WHERE user_id = ? AND day_number = ?",
         (user["id"], day_number)
     ).fetchone()
     if remaining["c"] == 0:
-        conn.execute("DELETE FROM daily_summary WHERE user_id = ? AND day_number = ?",
-                     (user["id"], day_number))
-    conn.commit()
-    conn.close()
+        db.execute("DELETE FROM daily_summary WHERE user_id = ? AND day_number = ?",
+                   (user["id"], day_number))
+    db.commit()
+    db.close()
     return {"message": "Meal deleted", "meal_id": meal_id}
 
 @app.get("/api/dashboard/stats")
 def dashboard_stats(user=Depends(get_current_user)):
-    conn = get_db()
+    db = get_db()
     current_day = calculate_day_number(user["created_at"])
-    stats = conn.execute(
+    stats = db.execute(
         """SELECT
             COUNT(*) as total_meals,
             AVG(total_calories) as avg_calories,
@@ -780,12 +952,17 @@ def dashboard_stats(user=Depends(get_current_user)):
            FROM meals WHERE user_id = ?""",
         (user["id"],)
     ).fetchone()
-    conn.close()
-    return {"current_day": current_day, "member_since": user["created_at"], **dict(stats)}
+    db.close()
+    return {"current_day": current_day, "member_since": str(user["created_at"]), **stats}
+
+
+# ═══════════════════════════════════════════
+# HEALTH CHECK
+# ═══════════════════════════════════════════
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "2.0.0", "database": "postgresql" if USE_PG else "sqlite"}
 
 if __name__ == "__main__":
     import uvicorn
