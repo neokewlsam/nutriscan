@@ -1147,6 +1147,8 @@ function ProfileScreen({ onLogout }) {
 export default function App() {
   const [authed, setAuthed] = useState(!!api.token);
   const [tab, setTab] = useState(0);
+  const [installPrompt, setInstallPrompt] = useState(null);
+  const [showInstall, setShowInstall] = useState(false);
 
   // Load Razorpay checkout script
   useEffect(() => {
@@ -1159,6 +1161,35 @@ export default function App() {
     }
   }, []);
 
+  // PWA install prompt
+  useEffect(() => {
+    const handler = (e) => {
+      e.preventDefault();
+      setInstallPrompt(e);
+      // Show install banner if not dismissed before
+      if (!localStorage.getItem("ns_install_dismissed")) {
+        setShowInstall(true);
+      }
+    };
+    window.addEventListener("beforeinstallprompt", handler);
+    return () => window.removeEventListener("beforeinstallprompt", handler);
+  }, []);
+
+  const handleInstall = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    const result = await installPrompt.userChoice;
+    if (result.outcome === "accepted") {
+      setShowInstall(false);
+    }
+    setInstallPrompt(null);
+  };
+
+  const dismissInstall = () => {
+    setShowInstall(false);
+    localStorage.setItem("ns_install_dismissed", "1");
+  };
+
   if (!authed) return <AuthScreen onAuth={() => setAuthed(true)} />;
 
   const tabs = [
@@ -1170,6 +1201,28 @@ export default function App() {
   return (
     <Theme theme="g10">
       <div style={{ minHeight: "100vh", background: "#f4f4f4", paddingBottom: 80 }}>
+
+        {/* PWA Install Banner */}
+        {showInstall && (
+          <div style={{
+            background: "#0f62fe", color: "#fff",
+            padding: "10px 16px", display: "flex",
+            alignItems: "center", justifyContent: "space-between",
+            fontSize: 13, gap: 12,
+          }}>
+            <span>📲 Install NutriScan for the best experience</span>
+            <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+              <Button kind="ghost" size="sm" onClick={handleInstall}
+                style={{ color: "#fff", minHeight: "auto", padding: "4px 12px" }}>
+                Install
+              </Button>
+              <Button kind="ghost" size="sm" onClick={dismissInstall}
+                style={{ color: "rgba(255,255,255,0.6)", minHeight: "auto", padding: "4px 8px" }}>
+                ✕
+              </Button>
+            </div>
+          </div>
+        )}
 
         {/* Top bar */}
         <div style={{
@@ -1198,6 +1251,7 @@ export default function App() {
           background: "#fff", borderTop: "1px solid #e0e0e0",
           display: "flex", zIndex: 9999,
           boxShadow: "0 -2px 8px rgba(0,0,0,0.06)",
+          paddingBottom: "env(safe-area-inset-bottom, 0px)",
         }}>
           {tabs.map((t, i) => (
             <button key={i} onClick={() => setTab(i)} style={{

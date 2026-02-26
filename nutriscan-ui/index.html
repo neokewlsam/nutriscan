@@ -1,13 +1,116 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>nutriscan-ui</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+
+    <!-- PWA Meta Tags -->
+    <title>NutriScan</title>
+    <meta name="description" content="AI-powered nutrition tracking with insulin resistance monitoring" />
+    <meta name="theme-color" content="#161616" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <!-- iOS specific -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="NutriScan" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+
+    <!-- Splash screens for iOS -->
+    <meta name="apple-mobile-web-app-orientations" content="portrait" />
+
+    <!-- App icons -->
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icons/icon-512.png" />
+
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="/manifest.json" />
+
+    <style>
+      /* Prevent pull-to-refresh on mobile */
+      html, body {
+        overscroll-behavior-y: contain;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      /* Safe area padding for notched phones */
+      body {
+        padding-top: env(safe-area-inset-top);
+        padding-bottom: env(safe-area-inset-bottom);
+        padding-left: env(safe-area-inset-left);
+        padding-right: env(safe-area-inset-right);
+      }
+
+      /* Splash screen while app loads */
+      #splash {
+        position: fixed;
+        inset: 0;
+        background: #161616;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        z-index: 99999;
+        transition: opacity 0.3s;
+      }
+      #splash.hide {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #splash .logo {
+        width: 64px;
+        height: 64px;
+        border-radius: 14px;
+        background: #0f62fe;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-size: 26px;
+        font-weight: 700;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        margin-bottom: 16px;
+      }
+      #splash .name {
+        color: white;
+        font-size: 22px;
+        font-weight: 300;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+    </style>
   </head>
+
   <body>
+    <!-- Splash screen -->
+    <div id="splash">
+      <div class="logo">NS</div>
+      <div class="name">NutriScan</div>
+    </div>
+
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
+
+    <script>
+      // Hide splash after app loads
+      window.addEventListener("load", () => {
+        setTimeout(() => {
+          const splash = document.getElementById("splash");
+          if (splash) {
+            splash.classList.add("hide");
+            setTimeout(() => splash.remove(), 300);
+          }
+        }, 800);
+      });
+
+      // Register service worker
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js").then(
+            (reg) => console.log("SW registered:", reg.scope),
+            (err) => console.log("SW failed:", err)
+          );
+        });
+      }
+    </script>
   </body>
 </html>
